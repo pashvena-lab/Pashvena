@@ -1,0 +1,177 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isAdmin() { return request.auth != null && request.auth.token.email == "pashvena@gmail.com"; }
+    function isSelf(uid) { return request.auth != null && request.auth.uid == uid; }
+    // second admin ("staff"): can see the admin data, can't change anything; their changes go to the main admin for approval
+    function isStaff() {
+      return request.auth != null
+        && exists(/databases/$(database)/documents/team/designers)
+        && ("staff" in get(/databases/$(database)/documents/team/designers).data)
+        && request.auth.token.email in get(/databases/$(database)/documents/team/designers).data.staff;
+    }
+    function canView() { return isAdmin() || isStaff(); }
+    function isDesigner() {
+      return request.auth != null
+        && exists(/databases/$(database)/documents/team/designers)
+        && request.auth.token.email in get(/databases/$(database)/documents/team/designers).data.emails;
+    }
+
+    match /products/{id} {
+      allow read: if true;
+      allow create: if isAdmin() || (isDesigner()
+        && request.resource.data.collection == "designer"
+        && hasDKey() && request.resource.data.designer == myDKey()
+        && request.resource.data.approval == "pending"
+        && !("hidden" in request.resource.data));
+      allow update, delete: if isAdmin();
+    }
+    match /promos/{code} {
+      allow get: if true;
+      allow list: if canView() || resource.data.public == true;
+      allow write: if isAdmin();
+    }
+    match /settings/{id} { allow read: if true; allow write: if isAdmin(); }
+    match /users/{uid} { allow read: if isSelf(uid) || canView(); allow write: if isSelf(uid) || isAdmin(); }
+    match /reviews/{id} {
+      allow read: if true;
+      allow create, update: if request.auth != null
+        && (request.auth.token.email_verified == true || request.auth.token.phone_number != null)
+        && request.resource.data.uid == request.auth.uid
+        && id == request.resource.data.pid + "_" + request.auth.uid
+        && request.resource.data.rating is number
+        && request.resource.data.rating >= 1 && request.resource.data.rating <= 5;
+      allow delete: if isAdmin() || (request.auth != null && resource.data.uid == request.auth.uid);
+    }
+    match /orders/{id} {
+      allow create: if (request.auth == null && request.resource.data.uid == null)
+        || (request.auth != null && request.resource.data.uid == request.auth.uid);
+      allow read: if canView() || (request.auth != null && resource.data.uid == request.auth.uid);
+      allow update, delete: if isAdmin();
+    }
+    match /requests/{id} {
+      allow create: if request.auth != null && request.resource.data.uid == request.auth.uid && request.resource.data.status == "New";
+      allow read: if canView() || (request.auth != null && resource.data.uid == request.auth.uid);
+      allow update, delete: if isAdmin();
+    }
+    match /team/{doc} {
+      allow read: if isAdmin() || (request.auth != null && (request.auth.token.email in resource.data.emails
+        || ("staff" in resource.data && request.auth.token.email in resource.data.staff)));
+      allow write: if isAdmin();
+    }
+    // public designer profiles: only the admin can change what the website shows
+    match /designers/{key} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+    match /dmsgs/{id} {
+      allow create: if (isAdmin() && request.resource.data.from == "admin")
+        || (isDesigner() && request.resource.data.from == "designer" && request.resource.data.designer == request.auth.token.email);
+      allow read: if canView() || (request.auth != null && resource.data.designer == request.auth.token.email);
+      allow update: if isAdmin() || (request.auth != null && resource.data.designer == request.auth.token.email
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["read"]));
+      allow delete: if isAdmin();
+    }
+    function myEmail() { return request.auth.token.email; }
+    function teamData() { return get(/databases/$(database)/documents/team/designers).data; }
+    function myDKey() { return teamData().keys[myEmail()]; }
+    function hasDKey() { return isDesigner() && ("keys" in teamData()) && (myEmail() in teamData().keys); }
+    // designer's own price (private): customers never see it
+    match /dcost/{pid} {
+      allow create: if isAdmin() || (isDesigner() && request.resource.data.designer == myEmail());
+      allow read: if canView() || (request.auth != null && resource.data.designer == myEmail());
+      allow update, delete: if isAdmin();
+    }
+    // a designer's share of each order (written by the admin app, read by that designer)
+    match /dsales/{id} {
+      allow read: if canView() || (request.auth != null && resource.data.designer == myEmail());
+      allow write: if isAdmin();
+    }
+    // payment requests from designers
+    match /payouts/{id} {
+      allow create: if isDesigner() && request.resource.data.designer == myEmail() && request.resource.data.status == "Requested";
+      allow read: if canView() || (request.auth != null && resource.data.designer == myEmail());
+      allow update, delete: if isAdmin();
+    }
+    // custom-design jobs the admin gives to a designer (no customer contact details inside)
+    match /djobs/{id} {
+      allow read: if canView() || (request.auth != null && resource.data.designer == myEmail());
+      allow create, delete: if isAdmin();
+      allow update: if isAdmin() || (isDesigner() && resource.data.designer == myEmail()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["dstatus","dquote","dnote","ddays","ddetails","dupdated"])
+        && request.resource.data.dstatus in ["Accepted","Declined"]);
+    }
+    // where a designer wants to be paid
+    match /dpay/{email} {
+      allow read: if isAdmin() || (request.auth != null && email == myEmail());
+      allow write: if isAdmin() || (isDesigner() && email == myEmail());
+    }
+    // order tracking: safe details only (no phone or full address); anyone with the order number can view one
+    match /track/{id} {
+      allow get: if true;
+      allow list: if canView();
+      allow create: if request.resource.data.status == "Pending";
+      allow update, delete: if isAdmin();
+    }
+    // return / exchange requests (only within the return window, only for delivered orders)
+    match /returns/{id} {
+      allow get: if true;
+      allow list: if canView();
+      allow create: if exists(/databases/$(database)/documents/track/$(id))
+        && get(/databases/$(database)/documents/track/$(id)).data.status == "Delivered"
+        && request.time.toMillis() < get(/databases/$(database)/documents/track/$(id)).data.deliveredAt + 14 * 86400000
+        && request.resource.data.status == "Requested";
+      allow update, delete: if isAdmin();
+    }
+    // website chat: customer ↔ Pashvena only. Designers have no access to customer chats.
+    match /threads/{tid} {
+      allow read: if canView() || (request.auth != null && resource.data.uid == request.auth.uid);
+      allow create: if isAdmin() || (request.auth != null && request.resource.data.uid == request.auth.uid);
+      allow update: if isAdmin() || (request.auth != null && resource.data.uid == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["updated","last"]));
+      allow delete: if isAdmin();
+      match /msgs/{mid} {
+        allow read: if canView() || (request.auth != null && get(/databases/$(database)/documents/threads/$(tid)).data.uid == request.auth.uid);
+        allow create: if request.resource.data.threadId == tid && (
+             (isAdmin() && request.resource.data.from == "admin")
+          || (request.auth != null && request.resource.data.from == "customer"
+              && get(/databases/$(database)/documents/threads/$(tid)).data.uid == request.auth.uid));
+        allow update, delete: if isAdmin();
+      }
+    }
+    // change requests from the second admin, approved or rejected by the main admin
+    match /changes/{id} {
+      allow create: if isStaff() && request.resource.data.by == request.auth.token.email && request.resource.data.status == "Pending";
+      allow read: if isAdmin() || (isStaff() && resource.data.by == request.auth.token.email);
+      allow update, delete: if isAdmin();
+    }
+    // change history: only the main admin can add records; nobody can edit or delete them
+    // (the only allowed update is marking a record as undone)
+    match /audit/{id} {
+      allow create: if isAdmin();
+      allow read: if canView();
+      allow update: if isAdmin() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["undone","undoneBy","undoOf"]);
+      allow delete: if false;
+    }
+    // anonymous visit counts: any visitor's browser can record its own visit; only admins can read them
+    function okVisit(d) {
+      return d.keys().hasOnly(["vid","start","last","src","how","landing","device","country","city","isNew","pages","views","carts","checkout","order","member"])
+        && d.vid is string && d.vid.size() < 30 && d.views is list && d.views.size() <= 40
+        && d.src is string && d.src.size() <= 60 && d.city is string && d.city.size() <= 40;
+    }
+    match /visits/{id} {
+      allow create: if okVisit(request.resource.data);
+      allow update: if okVisit(request.resource.data) && resource.data.vid == request.resource.data.vid;
+      allow read: if canView();
+      allow delete: if isAdmin();
+    }
+    // admin-only settings (email keys)
+    match /private/{doc} { allow read, write: if isAdmin(); }
+    match /drequests/{id} {
+      allow create: if isDesigner() && request.resource.data.designer == request.auth.token.email
+        && request.resource.data.status == "Open";
+      allow read: if canView() || (request.auth != null && resource.data.designer == request.auth.token.email);
+      allow update, delete: if isAdmin();
+    }
+  }
+}

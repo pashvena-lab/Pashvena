@@ -1,0 +1,6 @@
+User-agent: *
+Allow: /
+Disallow: /admin/
+Disallow: /designer/
+
+Sitemap: https://pashvena.com/sitemap.xml
